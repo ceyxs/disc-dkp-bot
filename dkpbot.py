@@ -16,9 +16,6 @@ intents = discord.Intents.default()
 intents.members = True
 intents.voice_states = True
 bot = discord.Bot(intents=intents)
-log_channel = int(os.getenv('LOG_CHANNEL'))
-results_channel = int(os.getenv('RESULTS_CHANNEL'))
-
 
 try:
     mydb = pymysql.connect(
@@ -53,19 +50,23 @@ roll_dict = {}
 item_cache = {}
 roll_tracker= defaultdict(set)
 
-async def send_log_channel_message(message):
-    chan = bot.get_channel(log_channel)
-    await chan.send(message)
+bot_config = {
+    'log_channel': None,
+    'results_channel': None,
+    'bot_category': None
+}
 
-def create_character_record(discord_id, character_name, character_class):
-    if(check_if_main_record_exists(discord_id) == False):
-        create_main_record(discord_id,character_name,0,character_class)
-        return "Created record for " + character_name
+async def send_channel_message(type,message,ctx=None):
+    match type:
+        case 'log':
+            channelvar = 'log_channel'
+        case 'bid_results':
+            channelvar = 'results_channel'
+    if bot_config[channelvar]:
+        chan = bot.get_channel(bot_config[channelvar])
+        await chan.send(message)
     else:
-        name = get_main_name_by_discord_id(discord_id)
-        ret = (f"A record already exists for your account for character name: {name}")
-        return ret
-
+        print("Unable to find fallback channel. Response channel not defined.")
 
 def get_main_name_by_discord_id(id):
     with get_cursor() as mycursor:
@@ -155,25 +156,36 @@ async def slow_count():
 
 @bot.event
 async def on_ready():
-    print(f"{bot.user} is ready and online!")
-
+    #print(f"{bot.user} is ready and online!")
+    print(f"Logged in as {bot.user}")
+    #check for saved channels
+    with get_cursor() as mycursor:
+        for key in bot_config:
+            mycursor.execute("SELECT value FROM bot_channels WHERE type = %s",(key,))
+            result = mycursor.fetchone()
+            if result:
+                bot_config[key] = result[0]
+            else:
+                print(f"No config found for {key}, make sure to set it with /setchannel.")
+        
 async def complete_bid(channel_id):
     with get_cursor(commit=True) as mycursor:
         mycursor.execute("SELECT item_name,top_bidder,top_bid_amt,second_bidder,second_bid_amt,main_has_bid FROM bids WHERE channel_id = %s", (channel_id,))
         result = mycursor.fetchone()
         if not result: #weird error
-            await send_log_channel_message(f"Error in bid #<{channel_id}>. did not return bid results upon complete.")
+            await send_channel_message('log',f"Error in bid #<{channel_id}>. did not return bid results upon complete.")
             return
         
         item_won, winner_id, amount_paid, second_bidder_id, second_bid_amt, main_has_bid = result
 
         if winner_id is None: #nobody bid. Grats rot.
-            channel = bot.get_channel(results_channel)
-            await channel.send(
-                f"**🏅 Bidding Complete!**\n"
-                f"**Item:** {item_won}\n"
-                f"**Winner:** Rot!"
+            result_msg = (
+                f"```🏅 Bidding Complete!\n"
+                f"Item: {item_won}\n"
+                f"Winner: Rot!```"
             )
+            await send_channel_message('bid_results',result_msg)
+            #channel = bot.get_channel(results_channel)
             return
         
         #get winner name
@@ -181,8 +193,13 @@ async def complete_bid(channel_id):
         result = mycursor.fetchone()
         if result:
             winner_name, winner_before_dkp = result
-        else:
-            winner_name = "Rot"
+
+        #ensure winner still has the DKP to complete
+        if amount_paid > winner_before_dkp:
+            await send_channel_message('log',f"""\nError in bid #<{channel_id}>. Winner did not have enough DKP to win item.
+                                           \nThis should only happen if they simultaneously bid on multiple items. 
+                                           \nNo dkp has been deducted and the bid has been cancelled for item: {item_won}.""")
+            return
 
         #get 2nd place winner name
         mycursor.execute("SELECT main_name FROM dkp WHERE discord_id = %s",(second_bidder_id,))
@@ -225,11 +242,12 @@ async def complete_bid(channel_id):
         #send log msg, also send to main channel for readability.
         chan = bot.get_channel(channel_id)
         await chan.send(log_message)
-        await send_log_channel_message(log_message)
+        await send_channel_message('log',log_message)
         
         #send pretty result msg
-        channel = bot.get_channel(results_channel)
-        await channel.send(result_string)
+        await send_channel_message('bid_results',result_string)
+        #channel = bot.get_channel(results_channel)
+        #await channel.send(result_string)
 
 async def complete_roll(channel_id):
     #pull winner ids from db, congratulate in log channel.
@@ -241,22 +259,26 @@ async def complete_roll(channel_id):
         if result:
             item_name, winner_id, second_id, winner_roll,second_roll,main_has_rolled = result
             winner_name = get_main_name_by_discord_id(winner_id)
+            if not winner_name:
+                message = (f"🎲 Roll completed for `{item_name}`. No rolls!")
+                await send_channel_message('log',message)
+                return
             message = (f"🎲 Roll completed for `{item_name}`. Winner: {winner_name} with a roll of {winner_roll}.")
             if main_has_rolled:
                 message += (f"`main`")
             else:
                 message += (f"`alt`")
-            await send_log_channel_message(message)
+            await send_channel_message('log',message)
             chan = bot.get_channel(channel_id)
             await chan.send(f"🎲 Roll completed for `{item_name}`. Winner: **{winner_name}** with a roll of {winner_roll}.")
             if second_id is not None:
                 second_name = get_main_name_by_discord_id(second_id)
-                await send_log_channel_message(f"└    Runner-up: {second_name} with a roll of {second_roll}.")
+                await send_channel_message('log',f"└    Runner-up: {second_name} with a roll of {second_roll}.")
                 await chan.send(f"└    Runner-up: {second_name} with a roll of {second_roll}.")
             #delete row
             mycursor.execute("DELETE FROM rolls WHERE channel_id = %s", (channel_id,))
         else:
-            await send_log_channel_message(f"Unable to retrieve roll results for channel: <#{channel_id}>.")
+            await send_channel_message('log',f"Unable to retrieve roll results for channel: <#{channel_id}>.")
 
 @bot.slash_command(name="register", description="Register a character with the bot.")
 async def register(
@@ -267,9 +289,18 @@ async def register(
         description="Your main character's class.",
         choices=['Bard', 'Beastlord', 'Cleric', 'Druid', 'Enchanter', 'Magician','Monk', 'Necromancer', 'Paladin', 'Ranger', 'Rogue','Shadowknight', 'Shaman', 'Warrior', 'Wizard'],
         )):
-        returnstring = create_character_record(ctx.author.id,character_name,character_class)
+        if not bot_config["log_channel"]:
+            await ctx.respond("No channel has been provided to log changes. Set one first with `/setchannel`", ephemeral=True)
+            return
+        discord_id = ctx.author.id
+        if(check_if_main_record_exists(discord_id) == False):
+            create_main_record(discord_id,character_name,0,character_class)
+            returnstring = "Created record for " + character_name
+            await send_channel_message('log',f"{ctx.author.mention} created DKP log for character: {character_name} class: {character_class}",ctx)
+        else:
+            name = get_main_name_by_discord_id(discord_id)
+            returnstring = (f"A record already exists for your account for character name: {name}")
         await ctx.respond(returnstring,ephemeral=True)
-        await send_log_channel_message(f"{ctx.author.mention} created DKP log for character: {character_name} class: {character_class}")
 
 @bot.slash_command(name="unregister", description="Remove a DKP record from the bot.")
 async def unregister(
@@ -277,6 +308,9 @@ async def unregister(
     character_name: str,
     reason:str
 ):
+    if not bot_config["log_channel"]:
+        await ctx.respond("No channel has been provided to log changes. Set one first with `/setchannel`", ephemeral=True)
+        return
     with get_cursor(commit=True) as mycursor:
         mycursor.execute("SELECT * FROM dkp WHERE main_name = %s", (character_name,))
         result = mycursor.fetchone()
@@ -288,15 +322,58 @@ async def unregister(
         logmessage = (f"{ctx.author.mention} deleted DKP record for character: {character_name}")
         if reason:
             logmessage += (f" for reason: {reason}")
-        await send_log_channel_message(logmessage)
+        await send_channel_message('log',logmessage,ctx)
 
+@bot.slash_command(name="setchannel", description="Set the channel this command is used in to be used for certain messages.")
+async def setchannel(
+    ctx: discord.ApplicationContext,
+    type: discord.Option(
+        str,
+        description="Your main character's class.",
+        choices=['log_channel','results_channel','bot_category'],
+        )):
+        with get_cursor(commit=True) as mycursor:
+            ctx_channel_id = None
+            if type == 'bot_category':
+                ctx_channel_id = ctx.channel.category.id
+            else:
+                ctx_channel_id = ctx.channel_id
+
+            #dont know if this is even possible
+            if not ctx_channel_id:
+                await ctx.respond(f"Unable to retrieve current channel information.")
+                return
+            
+            #grab current channel from db, if exists
+            mycursor.execute("SELECT value FROM bot_channels WHERE type = %s",(type,))
+            result = mycursor.fetchone()
+
+            
+            if not result:#no current channel. add row with value.
+                mycursor.execute("INSERT INTO bot_channels (type,value) VALUES (%s, %s)", (type,ctx_channel_id))
+            else:#update channel to current
+                mycursor.execute("UPDATE bot_channels SET value = %s WHERE type = %s",(ctx_channel_id,type))
+
+            if type == 'bot_category':
+                await ctx.respond(f"Set current channel's category for message type: {type}")
+            else:
+                await ctx.respond(f"Set current channel for message type: {type}")
+            
+            #update bot_config for no-SQL access
+            bot_config[type] = ctx_channel_id
 
 @bot.slash_command(name="startbid", description="Start bid on item for duration")
 async def startbid(ctx: discord.ApplicationContext, item_name:str, duration:int):
     #add sql to add to bids, start loop that checks if bid has ended
     endtime = time.time() + duration
-    cat = discord.utils.get(ctx.guild.channels, name="Bot")
-    chan = await ctx.guild.create_text_channel(name=f"💰-{item_name}",category=cat)
+    if not bot_config["bot_category"]:
+        await ctx.respond("No category set to create bids under. Run `/setchannel bot_category` in the desired category.",ephemeral=True)
+        return
+    if not bot_config["log_channel"]:
+        await ctx.respond("No channel has been provided to log changes. Set one first with `/setchannel`", ephemeral=True)
+        return
+    bot_category = bot.get_channel(bot_config['bot_category'])
+    chan = await ctx.guild.create_text_channel(name=f"💰-{item_name}",category=bot_category)
     await chan.send(
         f"**📢 Bidding now open for `{item_name}`!**\n"
         f"Start placing your bids using `/bid` now!\n"
@@ -308,13 +385,16 @@ async def startbid(ctx: discord.ApplicationContext, item_name:str, duration:int)
     if not slow_count.is_running():
         slow_count.start()
     await ctx.respond(f"Started bid for: {item_name} for {str(duration)} seconds",ephemeral=True)
-    await send_log_channel_message(f"{ctx.author.mention} started bid for {item_name} in <#{channel_id}> duration: {duration} seconds.")
+    await send_channel_message('log',f"{ctx.author.mention} started bid for {item_name} in <#{channel_id}> duration: {duration} seconds.",ctx)
 
 @bot.slash_command(name="startroll", description="Start a roll off for an item")
 async def startroll(ctx: discord.ApplicationContext, item_name:str, duration:int):
     endtime = time.time() + duration
-    cat = discord.utils.get(ctx.guild.channels, name="Bot")
-    chan = await ctx.guild.create_text_channel(name=f"🎲-{item_name}",category=cat)
+    bot_category = bot.get_channel(bot_config['bot_category'])
+    if not bot_category:
+        await ctx.respond("No category set to create rolls under. Run `/setchannel bot_category` in the desired category.",ephemeral=True)
+        return
+    chan = await ctx.guild.create_text_channel(name=f"🎲-{item_name}",category=bot_category)
     await chan.send(
         f"**📢 Rolls are now open for `{item_name}`!**\n"
         f"Start placing your bids using `/roll` now!\n"
@@ -326,7 +406,7 @@ async def startroll(ctx: discord.ApplicationContext, item_name:str, duration:int
     if not slow_count.is_running():
         slow_count.start()
     await ctx.respond(f"Started roll for: {item_name} for {str(duration)} seconds",ephemeral=True)
-    await send_log_channel_message(f"{ctx.author.mention} started roll for {item_name} in <#{channel_id}> duration: {duration} seconds.")
+    await send_channel_message('log',f"{ctx.author.mention} started roll for {item_name} in <#{channel_id}> duration: {duration} seconds.",ctx)
 
 @bot.slash_command(name="roll", description="Roll on an item in its roll channel.")
 async def roll(ctx: discord.ApplicationContext, roll_type: discord.Option(str, choices=['main','alt'])):
@@ -516,9 +596,9 @@ async def voice_channel_autocomplete(ctx: discord.AutocompleteContext):
 async def grantdkp(
     ctx: discord.ApplicationContext,
     amount: int,
-    is_attendance_tick: bool = False,
+    reason:str,
+    is_attendance_tick: bool,
     main_name: str = None,
-    reason:str = None,
     voice_channel: discord.Option(
         str,
         description="Select a voice channel",
@@ -530,6 +610,9 @@ async def grantdkp(
         return
     if main_name and voice_channel:
         await ctx.respond("Only provide a voice channel or main name to this command.", ephemeral=True)
+        return
+    if not bot_config["log_channel"]:
+        await ctx.respond("No channel has been provided to log changes. Set one first with `/setchannel`", ephemeral=True)
         return
     with get_cursor(commit=True) as mycursor:
         if main_name:
@@ -549,7 +632,7 @@ async def grantdkp(
                     value = disc_id
                     mycursor.execute(query, (value,))
                     response += (f" added attendance tick for user.")
-                await send_log_channel_message(response)
+                await send_channel_message('log',response,ctx)
                 return
             else:
                 await ctx.respond(f"Unable to find record for: {main_name}",ephemeral=True)
@@ -593,7 +676,8 @@ async def grantdkp(
                     values = [(discord_id,) for discord_id in discord_ids]
                     mycursor.executemany(query, values)
             await ctx.respond(f"Granted {amount} DKP to everyone in channel {voice_channel}.",ephemeral=True)
-            response = (f"{ctx.author} Granted {amount} DKP to: {', '.join(valid_members)}")
+            response = (f"{ctx.author} Granted {amount} DKP to: {', '.join(valid_members)}"
+                        + ("\n (Attendance Tick)" if is_attendance_tick else ""))
             if reason:
                 response += " for reason: " + reason
             if not_found_users:
@@ -601,7 +685,7 @@ async def grantdkp(
                     f"\n⚠️ The following users were **not found** in the DKP table and were skipped:\n"
                     f"{', '.join(not_found_users)}"
                 )
-            await send_log_channel_message(response)
+            await send_channel_message('log',response,ctx)
 
 @bot.slash_command(name="setdkp", description="Set the dkp of a player based on their main name.")
 async def setdkp(
@@ -609,6 +693,9 @@ async def setdkp(
     main_name:str,
     amount:int
 ):
+    if not bot_config["log_channel"]:
+        await ctx.respond("No channel has been provided to log changes. Set one first with `/setchannel`", ephemeral=True)
+        return
     with get_cursor(commit=True) as mycursor:
         query = "SELECT dkp_value FROM dkp WHERE main_name = %s" 
         mycursor.execute(query, (main_name,))
@@ -617,7 +704,7 @@ async def setdkp(
             pre_val = result[0]
             mycursor.execute("UPDATE dkp SET dkp_value = %s WHERE main_name = %s", (amount, main_name))
             await ctx.respond(f"Updated DKP for character {main_name} to {amount}.", ephemeral=True)
-            await send_log_channel_message(f"{ctx.author.mention} set dkp for {main_name} to {amount} (previously: {pre_val})")
+            await send_channel_message('log',f"{ctx.author.mention} set dkp for {main_name} to {amount} (previously: {pre_val})",ctx)
         else:
             await ctx.respond(f"Error: No main found by that name.", ephemeral=True)
 
@@ -641,20 +728,43 @@ async def attendancelist(
                 if not results:
                     await ctx.respond(f"No records found in DKP table.",ephemeral=True)
                 response =( f"```\n"
-                            f"{'Main Name':<10}|{'DKP':<8}|{'Total Attendance':<18}|{'90-Day':<18}|{'30-Day':<18}|\n")
+                            f"{'Main Name':<14}|{'DKP':<8}|{'Total Attendance':<18}|{'90-Day':<18}|{'30-Day':<18}|\n")
+                ninety_days_ago = datetime.datetime.now() - datetime.timedelta(days=90)
+                thirty_days_ago = datetime.datetime.now() - datetime.timedelta(days=30)
                 for row in results:
                     discord_id = row[0]
                     main_name = row[1]
                     dkp_value = row[2]
                     time_registered = row[3]
                     total_user_ticks, total_tick_count, total_percent = get_att(mycursor,discord_id,time_registered)
-                    ninety_days_ago = datetime.datetime.now() - datetime.timedelta(days=90)
                     ninety_day_user_ticks, total_ninety_ticks, ninety_percent = get_att(mycursor,discord_id,ninety_days_ago)
-                    thirty_days_ago = datetime.datetime.now() - datetime.timedelta(days=30)
                     thirty_day_user_ticks, total_thirty_ticks, thirty_percent = get_att(mycursor,discord_id,thirty_days_ago)
                     response +=(
-                        f"{'-' * 77}\n"
-                        f"{main_name:<10}|{dkp_value:<8}|{total_user_ticks:>4}/{total_tick_count:<4} = {total_percent:^5}%|{ninety_day_user_ticks:>4}/{total_ninety_ticks:<4} = {ninety_percent:^5}%|{thirty_day_user_ticks:>4}/{total_thirty_ticks:<4} = {thirty_percent:^5}%|\n"
+                        f"{'-' * 81}\n"
+                        f"{main_name:<14}|{dkp_value:<8}|{total_user_ticks:>4}/{total_tick_count:<4} = {total_percent:^5}%|{ninety_day_user_ticks:>4}/{total_ninety_ticks:<4} = {ninety_percent:^5}%|{thirty_day_user_ticks:>4}/{total_thirty_ticks:<4} = {thirty_percent:^5}%|\n"
+                    )
+                response += (f"```")
+                await ctx.respond(response,ephemeral=True)
+            else:
+                mycursor.execute("SELECT discord_id,main_name,dkp_value,time_registered FROM dkp WHERE character_class = %s ORDER BY dkp_value DESC LIMIT %s", (character_class, limit))
+                results = mycursor.fetchall()
+                if not results:
+                    await ctx.respond(f"No records found in DKP table.",ephemeral=True)
+                response =( f"```\n"
+                            f"{'Main Name':<14}|{'DKP':<8}|{'Total Attendance':<18}|{'90-Day':<18}|{'30-Day':<18}|\n")
+                ninety_days_ago = datetime.datetime.now() - datetime.timedelta(days=90)
+                thirty_days_ago = datetime.datetime.now() - datetime.timedelta(days=30)
+                for row in results:
+                    discord_id = row[0]
+                    main_name = row[1]
+                    dkp_value = row[2]
+                    time_registered = row[3]
+                    total_user_ticks, total_tick_count, total_percent = get_att(mycursor,discord_id,time_registered)
+                    ninety_day_user_ticks, total_ninety_ticks, ninety_percent = get_att(mycursor,discord_id,ninety_days_ago)
+                    thirty_day_user_ticks, total_thirty_ticks, thirty_percent = get_att(mycursor,discord_id,thirty_days_ago)
+                    response +=(
+                        f"{'-' * 81}\n"
+                        f"{main_name:<14}|{dkp_value:<8}|{total_user_ticks:>4}/{total_tick_count:<4} = {total_percent:^5}%|{ninety_day_user_ticks:>4}/{total_ninety_ticks:<4} = {ninety_percent:^5}%|{thirty_day_user_ticks:>4}/{total_thirty_ticks:<4} = {thirty_percent:^5}%|\n"
                     )
                 response += (f"```")
                 await ctx.respond(response,ephemeral=True)
@@ -697,6 +807,7 @@ async def dkp(
         else:
             await get_dkp_and_attendance(ctx)
 
+
 def get_att(cursor, discord_id, timestamp):
     #returns 1{ticks user has been present since timestamp}, 2{ticks that have occurred since timestamp}, {1/2}
     query_total = "SELECT COUNT(*) FROM attendance_ticks WHERE discord_id = %s"
@@ -729,9 +840,9 @@ async def get_dkp_and_attendance(ctx):
             thirty_day_user_ticks, total_thirty_ticks, thirty_percent = get_att(mycursor,id,thirty_days_ago)
             await ctx.respond(
                 f"```\n"
-                f"{'Main Name':<10}|{'DKP':<8}|{'Total Att':<18}|{'90-Day':<18}|{'30-Day':<18}|\n"
-                f"{'-' * 10}|{'-' * 8}|{'-' * 18}|{'-' * 18}|{'-' * 18}|\n"
-                f"{main_name:<10}|{dkp_value:<8}|{total_user_ticks:>4}/{total_tick_count:<4} = {total_percent:^5}%|{ninety_day_user_ticks:>4}/{total_ninety_ticks:<4} = {ninety_percent:^5}%|{thirty_day_user_ticks:>4}/{total_thirty_ticks:<4} = {thirty_percent:^5}%|\n"
+                f"{'Main Name':<14}|{'DKP':<8}|{'Total Att':<18}|{'90-Day':<18}|{'30-Day':<18}|\n"
+                f"{'-' * 14}|{'-' * 8}|{'-' * 18}|{'-' * 18}|{'-' * 18}|\n"
+                f"{main_name:<14}|{dkp_value:<8}|{total_user_ticks:>4}/{total_tick_count:<4} = {total_percent:^5}%|{ninety_day_user_ticks:>4}/{total_ninety_ticks:<4} = {ninety_percent:^5}%|{thirty_day_user_ticks:>4}/{total_thirty_ticks:<4} = {thirty_percent:^5}%|\n"
                 f"```",
                 ephemeral=True
             )
