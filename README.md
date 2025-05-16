@@ -20,17 +20,19 @@ Voice
 - Connect
 
 Your .env should look like:
-TOKEN={Token here}
-DB_USERNAME={db username here}
-DB_PASSWORD={db password here}
+```
+ TOKEN={Token here}
+ DB_USERNAME={db username here}
+ DB_PASSWORD={db password here}
+```
 
-Setup:
+## Setup:
 - Create a category to use for the bot as well as a log channel and a bidding results channel under that category.
 - Within the log channel, use /setchannel log_channel
 - Within the bidding results channel, use /setchannel results_channel
 - In either of the above two channels use /setchannel bot_category
 
-Commands:
+## Commands:
 **/register {main_name} {character_class}**
 - Registers the person interacting's discord ID and entered main name and character_class to the main DKP table with 0 DKP
 
