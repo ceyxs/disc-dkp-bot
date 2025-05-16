@@ -61,4 +61,4 @@ Your .env should look like:
 - Sets the DKP for main_name to amount directly.
  
 **/attendancelist {class} {limit}**
-- Returns a list of attendance %s for selected class, limited to limit. Default is 30, kind of a heavy command.
+- Returns a list of attendance %s for selected class, limited to limit. Default is 30.
